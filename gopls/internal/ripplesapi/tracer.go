@@ -157,7 +157,9 @@ func (t *DirectTracer) TraceToMain(pos Position, functionName string) ([]CallPat
 			FunctionName: item.Name,
 			PackagePath:  extractPackageFromItem(item),
 		}
-		t.traceIncomingCalls(item, []CallNode{initialNode}, visited, &paths, seenBinaries)
+		// Check if the initial symbol is in a common package
+		startedInCommonPkg := isCommonPackage(initialNode.PackagePath)
+		t.traceIncomingCalls(item, []CallNode{initialNode}, visited, &paths, seenBinaries, startedInCommonPkg)
 	}
 
 	return paths, nil
@@ -182,6 +184,7 @@ func (t *DirectTracer) traceIncomingCalls(
 	visited map[string]bool,
 	paths *[]CallPath,
 	seenBinaries map[string]bool,
+	startedInCommonPkg bool, // true if the original changed symbol was in a common package
 ) {
 	// Create a unique key for this item
 	key := fmt.Sprintf("%s:%d:%d", item.URI, item.Range.Start.Line, item.Range.Start.Character)
@@ -227,9 +230,32 @@ func (t *DirectTracer) traceIncomingCalls(
 		return
 	}
 
+	pkgPath := extractPackageFromItem(item)
+
 	if len(incomingCalls) == 0 {
 		// Dead end - no callers found
 		return
+	}
+
+	// Handle common package tracing logic
+	currentIsCommon := isCommonPackage(pkgPath)
+
+	if currentIsCommon {
+		if !startedInCommonPkg {
+			// We're tracing from internal/service and hit a common package - stop here
+			// Continuing would cause false positives due to interface calls
+			return
+		}
+		// If we started in a common package, we allow continuing through the same package
+		// But stop if we reach a DIFFERENT common package (to prevent cross-package tracing)
+		// Check: are we still in the original package or have we entered a different one?
+		if len(currentPath) > 0 {
+			originalPkg := currentPath[len(currentPath)-1].PackagePath // The first/original node
+			if isCommonPackage(originalPkg) && originalPkg != pkgPath {
+				// We've left the original common package and entered a different common package
+				return
+			}
+		}
 	}
 
 	// Recursively trace each caller
@@ -239,29 +265,116 @@ func (t *DirectTracer) traceIncomingCalls(
 			PackagePath:  extractPackageFromItem(call.From),
 		}
 
-		// Check for cross-service calls
-		if isCrossServiceCall(callerNode.PackagePath, currentPath) {
+		// Check if the caller is in a common package
+		callerIsCommon := isCommonPackage(callerNode.PackagePath)
+
+		// Case 1: Started from internal/ and reached a common package - stop
+		if callerIsCommon && !startedInCommonPkg {
 			continue
 		}
 
+		// Build the new path with the caller
 		newPath := append([]CallNode{callerNode}, currentPath...)
-		t.traceIncomingCalls(call.From, newPath, visited, paths, seenBinaries)
+
+		// Case 2: Started from common, went through internal, now back to common - stop
+		// This prevents: api/manager -> internal/bill -> pkg/grace -> cmd/rfs (wrong!)
+		// Pattern: common (changed) -> ... -> internal/service-A -> ... -> common (caller)
+		if callerIsCommon && startedInCommonPkg {
+			// Check if the path contains any internal/ package
+			hasInternal := false
+			for _, node := range currentPath {
+				if strings.Contains(node.PackagePath, "/internal/") {
+					hasInternal = true
+					break
+				}
+			}
+			// If we have: common (start) -> internal -> common (caller), stop here
+			if hasInternal {
+				continue
+			}
+		}
+
+		// Case 3: Check if this path crosses service boundaries
+		// This handles direct service-to-service calls
+		if isCrossServiceCall(newPath) {
+			continue
+		}
+
+		t.traceIncomingCalls(call.From, newPath, visited, paths, seenBinaries, startedInCommonPkg)
 	}
 }
 
-// isCrossServiceCall checks if a call crosses service boundaries
-func isCrossServiceCall(callerPkg string, currentPath []CallNode) bool {
-	if len(currentPath) == 0 {
+// isCrossServiceCall checks if a call path crosses service boundaries
+// It detects invalid cross-service calls, especially for internal/ packages
+func isCrossServiceCall(path []CallNode) bool {
+	if len(path) < 2 {
 		return false
 	}
 
-	callerService := extractServiceName(callerPkg)
+	// Collect all internal/ packages in the path
+	internalServices := make(map[string]bool)
+	for _, node := range path {
+		if strings.Contains(node.PackagePath, "/internal/") {
+			// Extract service name from "xxx/internal/service/..."
+			internalIdx := strings.Index(node.PackagePath, "/internal/")
+			if internalIdx >= 0 {
+				remaining := node.PackagePath[internalIdx+len("/internal/"):]
+				parts := strings.Split(remaining, "/")
+				if len(parts) > 0 {
+					internalServices[parts[0]] = true
+				}
+			}
+		}
+	}
 
-	for _, node := range currentPath {
+	// If no internal package found, use the old cross-service detection logic
+	if len(internalServices) == 0 {
+		// Check for cross-service calls between different cmd/ services
+		for i := 0; i < len(path)-1; i++ {
+			service1 := extractServiceName(path[i].PackagePath)
+			service2 := extractServiceName(path[i+1].PackagePath)
+
+			if service1 != "" && service2 != "" && service1 != service2 {
+				if !isCommonPackage(path[i].PackagePath) && !isCommonPackage(path[i+1].PackagePath) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// Internal packages found - check if path mixes different services
+	// If we have internal/bill and internal/rfs in the same path, it's invalid
+	if len(internalServices) > 1 {
+		return true // Cross-service call detected
+	}
+
+	// Single internal service - check if path crosses service boundaries via common packages
+	var singleInternalService string
+	for svc := range internalServices {
+		singleInternalService = svc
+		break
+	}
+
+	// Path is built from caller to callee: [caller, ..., callee]
+	// Example: [pkg/grace.main, internal/bill/server.Run, ..., api/manager/client.AdminListImage]
+	//
+	// We need to detect the pattern where:
+	// - Path contains internal/service-A nodes
+	// - Path also contains cmd/service-B or main package nodes (where service-B != service-A)
+	// - They are connected through common packages like pkg/grace
+	//
+	// This detects: cmd/rfs/main -> pkg/grace.main -> internal/bill/... -> api/manager/client
+
+	// Check each node in the path
+	for _, node := range path {
 		nodeService := extractServiceName(node.PackagePath)
 
-		if callerService != "" && nodeService != "" && callerService != nodeService {
+		// If this node belongs to a cmd/ or has a service name
+		if nodeService != "" && nodeService != singleInternalService {
+			// Check if this is not a common package
 			if !isCommonPackage(node.PackagePath) {
+				// This is a different service's cmd/ or internal/ - cross-service call!
 				return true
 			}
 		}
@@ -271,18 +384,25 @@ func isCrossServiceCall(callerPkg string, currentPath []CallNode) bool {
 }
 
 // extractServiceName extracts the service name from a package path
+// Package paths can be either relative (cmd/foo, internal/bar) or full (github.com/user/repo/cmd/foo)
 func extractServiceName(pkgPath string) string {
-	if strings.HasPrefix(pkgPath, "cmd/") {
-		parts := strings.Split(pkgPath, "/")
-		if len(parts) >= 2 {
-			return parts[1]
+	// Check for /cmd/ pattern (works for both relative and full paths)
+	if strings.Contains(pkgPath, "/cmd/") {
+		cmdIdx := strings.Index(pkgPath, "/cmd/")
+		remaining := pkgPath[cmdIdx+len("/cmd/"):]
+		parts := strings.Split(remaining, "/")
+		if len(parts) > 0 {
+			return parts[0]
 		}
 	}
 
-	if strings.HasPrefix(pkgPath, "internal/") {
-		parts := strings.Split(pkgPath, "/")
-		if len(parts) >= 2 {
-			return parts[1]
+	// Check for /internal/ pattern
+	if strings.Contains(pkgPath, "/internal/") {
+		internalIdx := strings.Index(pkgPath, "/internal/")
+		remaining := pkgPath[internalIdx+len("/internal/"):]
+		parts := strings.Split(remaining, "/")
+		if len(parts) > 0 {
+			return parts[0]
 		}
 	}
 
@@ -290,17 +410,18 @@ func extractServiceName(pkgPath string) string {
 }
 
 // isCommonPackage checks if a package is a common/shared package
+// Works with both relative and full package paths
 func isCommonPackage(pkgPath string) bool {
-	commonPrefixes := []string{
-		"pkg/",
-		"api/",
-		"common/",
-		"shared/",
-		"lib/",
+	commonPatterns := []string{
+		"/pkg/",
+		"/api/",
+		"/common/",
+		"/shared/",
+		"/lib/",
 	}
 
-	for _, prefix := range commonPrefixes {
-		if strings.HasPrefix(pkgPath, prefix) {
+	for _, pattern := range commonPatterns {
+		if strings.Contains(pkgPath, pattern) {
 			return true
 		}
 	}
