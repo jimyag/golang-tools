@@ -237,6 +237,12 @@ func (t *DirectTracer) traceIncomingCalls(
 		return
 	}
 
+	// CRITICAL: Filter out ambiguous interface calls
+	// When gopls returns incoming calls for an interface method, it includes ALL
+	// callers of that interface, not just the ones calling THIS specific implementation.
+	// We need to filter these to avoid cross-service false positives.
+	incomingCalls = t.filterAmbiguousInterfaceCalls(item, currentPath, incomingCalls, startedInCommonPkg)
+
 	// Handle common package tracing logic
 	currentIsCommon := isCommonPackage(pkgPath)
 
@@ -839,4 +845,124 @@ func extractBinaryNameFromPkgPath(pkgPath string) string {
 	}
 
 	return "unknown"
+}
+
+// filterAmbiguousInterfaceCalls filters out interface calls that would lead to cross-service false positives
+// Core idea: Use the ACTUAL CALL PATH we've been tracing to filter out unrelated branches
+// This completely avoids hardcoding any directory structures
+func (t *DirectTracer) filterAmbiguousInterfaceCalls(
+	currentItem protocol.CallHierarchyItem,
+	currentPath []CallNode,
+	incomingCalls []protocol.CallHierarchyIncomingCall,
+	startedInCommonPkg bool,
+) []protocol.CallHierarchyIncomingCall {
+	// If we only have one caller, no ambiguity
+	if len(incomingCalls) <= 1 {
+		return incomingCalls
+	}
+
+	// Heuristic 1: Check if current item is a method that might implement an interface
+	// Methods are more likely to be interface implementations
+	isLikelyInterfaceMethod := strings.Contains(currentItem.Name, ".") ||
+		(currentItem.Kind == protocol.Method)
+
+	if !isLikelyInterfaceMethod {
+		// Not an interface method, no filtering needed
+		return incomingCalls
+	}
+
+	// Heuristic 2: Check call site diversity
+	// Count unique caller packages
+	callerPackages := make(map[string]bool)
+	for _, call := range incomingCalls {
+		pkg := extractPackageFromItem(call.From)
+		callerPackages[pkg] = true
+	}
+
+	// If all callers are from the same package, no ambiguity
+	if len(callerPackages) <= 1 {
+		return incomingCalls
+	}
+
+	// Core filtering logic: Score each caller by its relationship to the current path
+	// The key insight: callers that share more package prefix with packages in currentPath
+	// are more likely to be the correct call chain
+
+	type scoredCall struct {
+		call  protocol.CallHierarchyIncomingCall
+		score int
+	}
+
+	var scoredCalls []scoredCall
+
+	currentPkg := extractPackageFromItem(currentItem)
+
+	for _, call := range incomingCalls {
+		callerPkg := extractPackageFromItem(call.From)
+		score := 0
+
+		// Score 1: How many packages in currentPath share prefix with this caller?
+		for _, node := range currentPath {
+			prefixLen := longestCommonPrefix(node.PackagePath, callerPkg)
+			// Weight by prefix length - longer prefix = more related
+			score += prefixLen / 10
+		}
+
+		// Score 2: Direct relationship to current package
+		directPrefixLen := longestCommonPrefix(currentPkg, callerPkg)
+		score += directPrefixLen / 5 // Higher weight for direct relationship
+
+		// Score 3: Is this caller already in our path? (circular reference or related flow)
+		for _, node := range currentPath {
+			if node.PackagePath == callerPkg {
+				score += 100 // Strong indicator of correct path
+				break
+			}
+		}
+
+		scoredCalls = append(scoredCalls, scoredCall{call: call, score: score})
+	}
+
+	// Find the best score
+	bestScore := -1
+	for _, sc := range scoredCalls {
+		if sc.score > bestScore {
+			bestScore = sc.score
+		}
+	}
+
+	// Critical threshold: Filter out callers with significantly lower scores
+	// This indicates they're likely from a different call tree (interface ambiguity)
+	const SCORE_THRESHOLD_RATIO = 0.5 // Keep callers within 50% of best score
+
+	filtered := make([]protocol.CallHierarchyIncomingCall, 0, len(incomingCalls))
+	for _, sc := range scoredCalls {
+		// Keep if score is close to the best score
+		if bestScore == 0 || sc.score >= int(float64(bestScore)*SCORE_THRESHOLD_RATIO) {
+			filtered = append(filtered, sc.call)
+		}
+	}
+
+	// Safety: If we filtered out everything, return all (conservative)
+	if len(filtered) == 0 {
+		return incomingCalls
+	}
+
+	return filtered
+}
+
+// longestCommonPrefix returns the length of the longest common prefix between two strings
+func longestCommonPrefix(s1, s2 string) int {
+	minLen := len(s1)
+	if len(s2) < minLen {
+		minLen = len(s2)
+	}
+
+	for i := 0; i < minLen; i++ {
+		if s1[i] != s2[i] {
+			return i
+		}
+	}
+
+	return minLen
 }
