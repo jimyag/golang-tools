@@ -234,6 +234,7 @@ func (t *DirectTracer) traceIncomingCalls(
 
 	if len(incomingCalls) == 0 {
 		// Dead end - no callers found
+		fmt.Printf("Debug: No incoming calls found for %s (package: %s)\n", item.Name, pkgPath)
 		return
 	}
 
