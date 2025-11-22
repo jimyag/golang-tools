@@ -6,9 +6,11 @@ import (
 	"context"
 	"fmt"
 	"go/ast"
+	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/rs/zerolog"
 	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/cache/metadata"
 	"golang.org/x/tools/gopls/internal/cache/parsego"
@@ -17,6 +19,20 @@ import (
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/settings"
 )
+
+var log = initLogger()
+
+func initLogger() zerolog.Logger {
+	// Default to disabled level (higher than all log levels)
+	level := zerolog.Disabled
+
+	// Allow enabling debug logs via environment variable
+	if os.Getenv("RIPPLES_DEBUG") == "1" || os.Getenv("RIPPLES_DEBUG") == "true" {
+		level = zerolog.DebugLevel
+	}
+
+	return zerolog.New(os.Stderr).Level(level)
+}
 
 // Position represents a position in a source file
 type Position struct {
@@ -149,7 +165,8 @@ func (t *DirectTracer) TraceToMain(pos Position, functionName string) ([]CallPat
 
 	// Debug: print what PrepareCallHierarchy found
 	for i, item := range items {
-		fmt.Printf("Debug PrepareCallHierarchy[%d]: %s (kind: %v)\n", i, item.Name, item.Kind)
+		log.Debug().Int("index", i).Str("name", item.Name).Interface("kind", item.Kind).
+			Msg("PrepareCallHierarchy found item")
 	}
 
 	// Trace incoming calls recursively
@@ -182,6 +199,44 @@ func extractPackageFromItem(item protocol.CallHierarchyItem) string {
 	return ""
 }
 
+// extractServiceIdentifier extracts a service identifier from a package path
+// For example:
+//   - "example.com/project/cmd/service-a" -> "service-a"
+//   - "example.com/project/internal/service-b" -> "service-b"
+//   - "example.com/project/internal/bill/server" -> "bill"
+// This helps identify which service a package belongs to
+func extractServiceIdentifier(pkgPath string) string {
+	// Split by /
+	parts := strings.Split(pkgPath, "/")
+
+	// Look for service-identifying segments
+	// Common patterns: cmd/xxx, internal/xxx, services/xxx
+	for i, part := range parts {
+		// Check if this is a service-related directory
+		if part == "cmd" || part == "internal" || part == "services" || part == "apps" {
+			// The next part is likely the service name
+			if i+1 < len(parts) {
+				return parts[i+1]
+			}
+		}
+	}
+
+	return ""
+}
+
+// extractPackageFromURI extracts the package path by querying gopls for the URI's package
+func (t *DirectTracer) extractPackageFromURI(uri protocol.DocumentURI) string {
+	// Get package metadata for this file
+	// The third parameter (includeIntermediateTestVariants) should be false
+	pkgs, err := t.snapshot.MetadataForFile(t.ctx, uri, false)
+	if err != nil || len(pkgs) == 0 {
+		return ""
+	}
+
+	// Return the first package's PkgPath (import path)
+	return string(pkgs[0].PkgPath)
+}
+
 // traceIncomingCalls recursively traces incoming calls
 func (t *DirectTracer) traceIncomingCalls(
 	item protocol.CallHierarchyItem,
@@ -191,10 +246,13 @@ func (t *DirectTracer) traceIncomingCalls(
 	seenBinaries map[string]bool,
 	startedInCommonPkg bool, // true if the original changed symbol was in a common package
 ) {
+	log.Debug().Str("name", item.Name).Msg("traceIncomingCalls")
+
 	// Create a unique key for this item
 	key := fmt.Sprintf("%s:%d:%d", item.URI, item.Range.Start.Line, item.Range.Start.Character)
 
 	if visited[key] {
+		log.Debug().Str("key", key).Msg("Already visited")
 		return
 	}
 	visited[key] = true
@@ -239,8 +297,14 @@ func (t *DirectTracer) traceIncomingCalls(
 
 	if len(incomingCalls) == 0 {
 		// Dead end - no callers found
-		fmt.Printf("Debug: No incoming calls found for %s (package: %s)\n", item.Name, pkgPath)
+		log.Debug().Str("name", item.Name).Str("package", pkgPath).Msg("No incoming calls found")
 		return
+	}
+
+	log.Debug().Str("name", item.Name).Int("count", len(incomingCalls)).Msg("IncomingCalls returned callers")
+	for i, call := range incomingCalls {
+		log.Debug().Int("index", i).Str("name", call.From.Name).
+			Str("detail", call.From.Detail).Str("uri", string(call.From.URI)).Msg("Caller")
 	}
 
 	// CRITICAL: Filter out ambiguous interface calls
@@ -249,68 +313,25 @@ func (t *DirectTracer) traceIncomingCalls(
 	// We need to filter these to avoid cross-service false positives.
 	incomingCalls = t.filterAmbiguousInterfaceCalls(item, currentPath, incomingCalls, startedInCommonPkg)
 
-	// Handle common package tracing logic
-	currentIsCommon := isCommonPackage(pkgPath)
-
-	if currentIsCommon {
-		if !startedInCommonPkg {
-			// We're tracing from internal/service and hit a common package - stop here
-			// Continuing would cause false positives due to interface calls
-			return
-		}
-		// If we started in a common package, we allow continuing through the same package
-		// But stop if we reach a DIFFERENT common package (to prevent cross-package tracing)
-		// Check: are we still in the original package or have we entered a different one?
-		if len(currentPath) > 0 {
-			originalPkg := currentPath[len(currentPath)-1].PackagePath // The first/original node
-			if isCommonPackage(originalPkg) && originalPkg != pkgPath {
-				// We've left the original common package and entered a different common package
-				return
-			}
-		}
-	}
-
 	// Recursively trace each caller
 	for _, call := range incomingCalls {
+		// Use URI-based package extraction for accurate results
+		// (Detail can be incorrect for interface calls)
+		callerPkg := t.extractPackageFromURI(call.From.URI)
+		if callerPkg == "" {
+			// Fallback to Detail-based extraction
+			callerPkg = extractPackageFromItem(call.From)
+		}
+
 		callerNode := CallNode{
 			FunctionName: call.From.Name,
-			PackagePath:  extractPackageFromItem(call.From),
+			PackagePath:  callerPkg,
 		}
-
-		// Check if the caller is in a common package
-		callerIsCommon := isCommonPackage(callerNode.PackagePath)
-
-		// Case 1: Started from internal/ and reached a common package - stop
-		if callerIsCommon && !startedInCommonPkg {
-			continue
-		}
+		log.Debug().Str("name", call.From.Name).Str("package", callerPkg).
+			Str("detail", call.From.Detail).Msg("Adding caller")
 
 		// Build the new path with the caller
 		newPath := append([]CallNode{callerNode}, currentPath...)
-
-		// Case 2: Started from common, went through internal, now back to common - stop
-		// This prevents: api/manager -> internal/bill -> pkg/grace -> cmd/rfs (wrong!)
-		// Pattern: common (changed) -> ... -> internal/service-A -> ... -> common (caller)
-		if callerIsCommon && startedInCommonPkg {
-			// Check if the path contains any internal/ package
-			hasInternal := false
-			for _, node := range currentPath {
-				if strings.Contains(node.PackagePath, "/internal/") {
-					hasInternal = true
-					break
-				}
-			}
-			// If we have: common (start) -> internal -> common (caller), stop here
-			if hasInternal {
-				continue
-			}
-		}
-
-		// Case 3: Check if this path crosses service boundaries
-		// This handles direct service-to-service calls
-		if isCrossServiceCall(newPath) {
-			continue
-		}
 
 		t.traceIncomingCalls(call.From, newPath, visited, paths, seenBinaries, startedInCommonPkg)
 	}
@@ -424,21 +445,48 @@ func extractServiceName(pkgPath string) string {
 // isCommonPackage checks if a package is a common/shared package
 // Works with both relative and full package paths
 func isCommonPackage(pkgPath string) bool {
+	// Check if this is a truly shared package, not service-specific
+	// Shared packages are those that don't have a service identifier in their path
+	// For example:
+	//   - github.com/qbox/las/pkg/grace -> shared (no service ID after /pkg/)
+	//   - github.com/qbox/las/api/manager/client -> NOT shared (has /internal/ or service-specific sub-path)
+	//   - example.com/project/pkg/common -> shared
+
+	// First check if it contains common package patterns
 	commonPatterns := []string{
 		"/pkg/",
-		"/api/",
 		"/common/",
 		"/shared/",
 		"/lib/",
 	}
 
+	hasCommonPattern := false
 	for _, pattern := range commonPatterns {
 		if strings.Contains(pkgPath, pattern) {
-			return true
+			hasCommonPattern = true
+			break
 		}
 	}
 
-	return false
+	if !hasCommonPattern {
+		return false
+	}
+
+	// Check that it doesn't contain service-specific indicators AFTER the common pattern
+	// If there's an /internal/ or /cmd/ after /pkg/, it's service-specific
+	afterPkg := ""
+	if idx := strings.Index(pkgPath, "/pkg/"); idx >= 0 {
+		afterPkg = pkgPath[idx+5:]
+	} else if idx := strings.Index(pkgPath, "/common/"); idx >= 0 {
+		afterPkg = pkgPath[idx+8:]
+	} else if idx := strings.Index(pkgPath, "/shared/"); idx >= 0 {
+		afterPkg = pkgPath[idx+8:]
+	} else if idx := strings.Index(pkgPath, "/lib/"); idx >= 0 {
+		afterPkg = pkgPath[idx+5:]
+	}
+
+	// If there's nothing after, or no service-specific marker, it's shared
+	return !strings.Contains(afterPkg, "/internal/") && !strings.Contains(afterPkg, "/cmd/")
 }
 
 // isMainFunction checks if an item is a main function
@@ -867,32 +915,47 @@ func (t *DirectTracer) filterAmbiguousInterfaceCalls(
 		return incomingCalls
 	}
 
-	// Heuristic 1: Check if current item is a method that might implement an interface
-	// Methods are more likely to be interface implementations
-	isLikelyInterfaceMethod := strings.Contains(currentItem.Name, ".") ||
-		(currentItem.Kind == protocol.Method)
-
-	if !isLikelyInterfaceMethod {
-		// Not an interface method, no filtering needed
+	// Check if the CURRENT ITEM (the function being traced) is in a shared/common package
+	// If so, don't filter - all callers are legitimate (multiple services can call shared functions)
+	currentPkg := extractPackageFromItem(currentItem)
+	if isCommonPackage(currentPkg) {
+		log.Debug().Str("currentPkg", currentPkg).Msg("Current item is in shared package, no filtering needed")
 		return incomingCalls
 	}
 
-	// Heuristic 2: Check call site diversity
+	// Check call site diversity
 	// Count unique caller packages
+	// IMPORTANT: Use URI-based extraction for accurate package identification
 	callerPackages := make(map[string]bool)
 	for _, call := range incomingCalls {
-		pkg := extractPackageFromItem(call.From)
+		pkg := t.extractPackageFromURI(call.From.URI)
+		if pkg == "" {
+			pkg = extractPackageFromItem(call.From)
+		}
 		callerPackages[pkg] = true
+	}
+
+	log.Debug().Int("count", len(callerPackages)).Msg("Found unique caller packages")
+	for pkg := range callerPackages {
+		log.Debug().Str("package", pkg).Msg("Caller package")
 	}
 
 	// If all callers are from the same package, no ambiguity
 	if len(callerPackages) <= 1 {
+		log.Debug().Msg("Only one unique package, no filtering needed")
 		return incomingCalls
 	}
 
 	// Core filtering logic: Score each caller by its relationship to the current path
 	// The key insight: callers that share more package prefix with packages in currentPath
 	// are more likely to be the correct call chain
+
+	log.Debug().Str("currentItem", currentItem.Name).Int("pathLen", len(currentPath)).
+		Msg("filterAmbiguousInterfaceCalls")
+	for i, node := range currentPath {
+		log.Debug().Int("index", i).Str("package", node.PackagePath).
+			Str("function", node.FunctionName).Msg("currentPath node")
+	}
 
 	type scoredCall struct {
 		call  protocol.CallHierarchyIncomingCall
@@ -901,10 +964,14 @@ func (t *DirectTracer) filterAmbiguousInterfaceCalls(
 
 	var scoredCalls []scoredCall
 
-	currentPkg := extractPackageFromItem(currentItem)
+	log.Debug().Str("currentPkg", currentPkg).Msg("Current package")
 
 	for _, call := range incomingCalls {
-		callerPkg := extractPackageFromItem(call.From)
+		// Use URI-based extraction for accurate package identification
+		callerPkg := t.extractPackageFromURI(call.From.URI)
+		if callerPkg == "" {
+			callerPkg = extractPackageFromItem(call.From)
+		}
 		score := 0
 
 		// Score 1: How many packages in currentPath share prefix with this caller?
@@ -926,6 +993,41 @@ func (t *DirectTracer) filterAmbiguousInterfaceCalls(
 			}
 		}
 
+		// Score 4: Check for service name consistency
+		// Extract service identifiers from paths (e.g., "service-a", "service-b", "bill", "rfs")
+		// If the path contains a specific service identifier and the caller also contains it,
+		// give a bonus score
+		// BUT: Only apply this if currentPath actually contains service-specific packages
+		// (not just shared packages). This prevents over-filtering when tracing from shared packages.
+		hasServiceSpecificPath := false
+		for _, node := range currentPath {
+			nodeServiceID := extractServiceIdentifier(node.PackagePath)
+			if nodeServiceID != "" {
+				hasServiceSpecificPath = true
+				log.Debug().Str("package", node.PackagePath).Str("serviceID", nodeServiceID).
+					Msg("Found service-specific path")
+				break
+			}
+		}
+
+		if hasServiceSpecificPath {
+			callerServiceID := extractServiceIdentifier(callerPkg)
+			if callerServiceID != "" {
+				for _, node := range currentPath {
+					nodeServiceID := extractServiceIdentifier(node.PackagePath)
+					if nodeServiceID != "" && nodeServiceID == callerServiceID {
+						score += 50 // Bonus for matching service identifier
+						log.Debug().Str("callerID", callerServiceID).Str("nodeID", nodeServiceID).
+							Msg("Service ID match bonus")
+					}
+				}
+			}
+		} else {
+			log.Debug().Msg("No service-specific path, skipping service ID bonus")
+		}
+
+		log.Debug().Str("name", call.From.Name).Str("package", callerPkg).Int("score", score).
+			Msg("Caller scored")
 		scoredCalls = append(scoredCalls, scoredCall{call: call, score: score})
 	}
 

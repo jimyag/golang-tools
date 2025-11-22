@@ -26,6 +26,9 @@ require (
 	github.com/fatih/structtag v1.2.0 // indirect
 	github.com/google/jsonschema-go v0.3.0 // indirect
 	github.com/google/safehtml v0.1.0 // indirect
+	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/mattn/go-isatty v0.0.19 // indirect
+	github.com/rs/zerolog v1.34.0 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/sys v0.38.0 // indirect
