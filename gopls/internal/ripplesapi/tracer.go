@@ -147,6 +147,11 @@ func (t *DirectTracer) TraceToMain(pos Position, functionName string) ([]CallPat
 			functionName, pos.Filename, pos.Line, pos.Column)
 	}
 
+	// Debug: print what PrepareCallHierarchy found
+	for i, item := range items {
+		fmt.Printf("Debug PrepareCallHierarchy[%d]: %s (kind: %v)\n", i, item.Name, item.Kind)
+	}
+
 	// Trace incoming calls recursively
 	var paths []CallPath
 	visited := make(map[string]bool)
