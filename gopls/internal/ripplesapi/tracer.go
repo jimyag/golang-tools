@@ -5,10 +5,13 @@ package ripplesapi
 import (
 	"context"
 	"fmt"
+	"go/ast"
 	"path/filepath"
 	"strings"
 
 	"golang.org/x/tools/gopls/internal/cache"
+	"golang.org/x/tools/gopls/internal/cache/metadata"
+	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/gopls/internal/golang"
 	"golang.org/x/tools/gopls/internal/protocol"
@@ -450,14 +453,88 @@ func (t *DirectTracer) findContainingFunction(uri protocol.DocumentURI, position
 		return "", err
 	}
 
-	// Prepare call hierarchy at this position
+	// Try PrepareCallHierarchy first (works if position is at function declaration)
 	items, err := golang.PrepareCallHierarchy(t.ctx, t.snapshot, fh, position)
-	if err != nil || len(items) == 0 {
-		return "", fmt.Errorf("no containing function found")
+	if err == nil && len(items) > 0 {
+		return items[0].Name, nil
 	}
 
-	// The first item should be the containing function
-	return items[0].Name, nil
+	// If PrepareCallHierarchy doesn't work, use AST to find the containing function
+	// This works for any position inside a function body
+	pgf, err := t.snapshot.ParseGo(t.ctx, fh, parsego.Full)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse file: %w", err)
+	}
+
+	// Convert position to offset
+	offset, err := pgf.Mapper.PositionOffset(position)
+	if err != nil {
+		return "", fmt.Errorf("failed to convert position to offset: %w", err)
+	}
+
+	// Find the enclosing function by walking the AST
+	var foundFunc string
+	ast.Inspect(pgf.File, func(n ast.Node) bool {
+		if foundFunc != "" {
+			return false
+		}
+
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok {
+			return true
+		}
+
+		// Check if the offset is within this function
+		if fn.Pos() <= pgf.Tok.Pos(offset) && pgf.Tok.Pos(offset) <= fn.End() {
+			if fn.Name != nil {
+				foundFunc = fn.Name.Name
+				return false
+			}
+		}
+
+		return true
+	})
+
+	if foundFunc != "" {
+		return foundFunc, nil
+	}
+
+	return "", fmt.Errorf("no containing function found at %s:%d:%d", uri, position.Line, position.Character)
+}
+
+// findFunctionDeclaration finds the declaration position of a function by name
+func (t *DirectTracer) findFunctionDeclaration(fh file.Handle, funcName string) (Position, error) {
+	pgf, err := t.snapshot.ParseGo(t.ctx, fh, parsego.Full)
+	if err != nil {
+		return Position{}, err
+	}
+
+	var foundPos Position
+	ast.Inspect(pgf.File, func(n ast.Node) bool {
+		if foundPos.Filename != "" {
+			return false
+		}
+
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok || fn.Name == nil || fn.Name.Name != funcName {
+			return true
+		}
+
+		// Found the function declaration
+		pos := pgf.Tok.Position(fn.Name.Pos())
+		foundPos = Position{
+			Filename: pos.Filename,
+			Line:     pos.Line,
+			Column:   pos.Column,
+		}
+		return false
+	})
+
+	if foundPos.Filename != "" {
+		return foundPos, nil
+	}
+
+	return Position{}, fmt.Errorf("function %s not found", funcName)
 }
 
 // TraceReferencesToMain traces all references of a symbol to main functions
@@ -482,14 +559,32 @@ func (t *DirectTracer) TraceReferencesToMain(pos Position, symbolName string) ([
 		}
 
 		// Convert reference position back to Position
+		// We use the reference position because PrepareCallHierarchy will find the function declaration
 		refPos := Position{
 			Filename: strings.TrimPrefix(ref.URI, "file://"),
 			Line:     int(ref.Range.Start.Line) + 1,
 			Column:   int(ref.Range.Start.Character) + 1,
 		}
 
+		// Get file handle
+		uri := protocol.URIFromPath(refPos.Filename)
+		fh, err := t.snapshot.ReadFile(t.ctx, uri)
+		if err != nil {
+			fmt.Printf("Warning: failed to read file %s: %v\n", refPos.Filename, err)
+			continue
+		}
+
+		// Try to find the containing function declaration
+		// Since we already have the function name from findContainingFunction,
+		// we can search for it in the file
+		funcPos, err := t.findFunctionDeclaration(fh, ref.ContainingFunc)
+		if err != nil {
+			// Fall back to using the reference position
+			funcPos = refPos
+		}
+
 		// Trace this reference's containing function to main
-		paths, err := t.TraceToMain(refPos, ref.ContainingFunc)
+		paths, err := t.TraceToMain(funcPos, ref.ContainingFunc)
 		if err != nil {
 			// Log but continue with other references
 			fmt.Printf("Warning: failed to trace %s: %v\n", ref.ContainingFunc, err)
@@ -506,4 +601,121 @@ func (t *DirectTracer) TraceReferencesToMain(pos Position, symbolName string) ([
 	}
 
 	return allPaths, nil
+}
+
+// FindMainPackagesImporting finds all main packages that import the target package (directly or indirectly)
+// This is used for tracing init functions - when an init function changes, all main packages that import
+// its package (even indirectly) are affected
+func (t *DirectTracer) FindMainPackagesImporting(targetPkgPath string) ([]CallPath, error) {
+	// Load the metadata graph to ensure all packages are loaded
+	graph, err := t.snapshot.LoadMetadataGraph(t.ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load metadata graph: %w", err)
+	}
+	if graph == nil {
+		return nil, fmt.Errorf("no metadata graph available")
+	}
+
+	var mainPackages []CallPath
+
+	// Iterate through all packages to find main packages
+	for _, meta := range graph.Packages {
+		if meta.Name != "main" {
+			continue
+		}
+
+		// Check if this main package imports the target package (directly or indirectly)
+		if t.importsPackage(graph, meta, targetPkgPath) {
+			// Extract binary name from the package path
+			binaryName := extractBinaryNameFromPkgPath(string(meta.PkgPath))
+
+			// Get the main URI
+			mainURI := ""
+			if len(meta.GoFiles) > 0 {
+				mainURI = string(meta.GoFiles[0])
+			}
+
+			// Create a minimal call path - for init functions, there's no explicit call chain
+			// The init function runs automatically when the package is imported
+			mainPackages = append(mainPackages, CallPath{
+				BinaryName: binaryName,
+				MainURI:    mainURI,
+				Path: []CallNode{
+					{
+						FunctionName: "main",
+						PackagePath:  string(meta.PkgPath),
+					},
+				},
+			})
+		}
+	}
+
+	return mainPackages, nil
+}
+
+// importsPackage checks if a package imports the target package (directly or indirectly)
+func (t *DirectTracer) importsPackage(graph *metadata.Graph, meta *metadata.Package, targetPkgPath string) bool {
+	visited := make(map[metadata.PackageID]bool)
+	return t.importsPackageRecursive(graph, meta, targetPkgPath, visited)
+}
+
+// importsPackageRecursive recursively checks package imports
+func (t *DirectTracer) importsPackageRecursive(graph *metadata.Graph, meta *metadata.Package, targetPkgPath string, visited map[metadata.PackageID]bool) bool {
+	// Already visited
+	if visited[meta.ID] {
+		return false
+	}
+	visited[meta.ID] = true
+
+	pkgPath := string(meta.PkgPath)
+
+	// Found it!
+	if pkgPath == targetPkgPath {
+		return true
+	}
+
+	// Check direct dependencies
+	for depID := range meta.DepsByPkgPath {
+		depPkgPath := string(depID)
+
+		// Quick check: if this is the target, we found it
+		if depPkgPath == targetPkgPath {
+			return true
+		}
+
+		// Get metadata for this dependency from the graph
+		for pid, depMeta := range graph.Packages {
+			if string(depMeta.PkgPath) == depPkgPath {
+				// Recursively check this dependency
+				if t.importsPackageRecursive(graph, depMeta, targetPkgPath, visited) {
+					return true
+				}
+				// Found the metadata for this dependency, no need to continue looping
+				_ = pid
+				break
+			}
+		}
+	}
+
+	return false
+}
+
+// extractBinaryNameFromPkgPath extracts binary name from package path
+// Example: "example.com/init-test/cmd/server" -> "server"
+func extractBinaryNameFromPkgPath(pkgPath string) string {
+	parts := strings.Split(string(pkgPath), "/")
+
+	// Look for "cmd" in the path
+	for i, part := range parts {
+		if part == "cmd" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+
+	// Fallback: use last part
+	if len(parts) > 0 {
+		return parts[len(parts)-1]
+	}
+
+	return "unknown"
 }
