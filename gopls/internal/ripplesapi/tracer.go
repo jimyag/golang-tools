@@ -387,3 +387,123 @@ func (t *DirectTracer) findFunctionNamePosition(fh file.Handle, pos Position, fu
 	// Couldn't find it, return original position
 	return pos, fmt.Errorf("function name not found in nearby lines")
 }
+
+// Reference represents a reference to a symbol
+type Reference struct {
+	URI          string
+	Range        protocol.Range
+	ContainingFunc string // Name of the function containing this reference
+}
+
+// FindReferences finds all references to a symbol at the given position
+func (t *DirectTracer) FindReferences(pos Position, symbolName string) ([]Reference, error) {
+	// Convert file path to URI
+	uri := protocol.URIFromPath(pos.Filename)
+
+	// Get file handle from snapshot
+	fh, err := t.snapshot.ReadFile(t.ctx, uri)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+
+	// Convert position to protocol.Position (0-based)
+	position := protocol.Position{
+		Line:      uint32(pos.Line - 1),
+		Character: uint32(pos.Column - 1),
+	}
+
+	// Call gopls internal References API
+	locations, err := golang.References(t.ctx, t.snapshot, fh, position, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find references: %w", err)
+	}
+
+	if len(locations) == 0 {
+		return nil, nil
+	}
+
+	// Convert locations to references
+	var refs []Reference
+	for _, loc := range locations {
+		ref := Reference{
+			URI:   string(loc.URI),
+			Range: loc.Range,
+		}
+
+		// Try to find the containing function for this reference
+		containingFunc, err := t.findContainingFunction(loc.URI, loc.Range.Start)
+		if err == nil {
+			ref.ContainingFunc = containingFunc
+		}
+
+		refs = append(refs, ref)
+	}
+
+	return refs, nil
+}
+
+// findContainingFunction finds the function containing a given position
+func (t *DirectTracer) findContainingFunction(uri protocol.DocumentURI, position protocol.Position) (string, error) {
+	// Get file handle
+	fh, err := t.snapshot.ReadFile(t.ctx, uri)
+	if err != nil {
+		return "", err
+	}
+
+	// Prepare call hierarchy at this position
+	items, err := golang.PrepareCallHierarchy(t.ctx, t.snapshot, fh, position)
+	if err != nil || len(items) == 0 {
+		return "", fmt.Errorf("no containing function found")
+	}
+
+	// The first item should be the containing function
+	return items[0].Name, nil
+}
+
+// TraceReferencesToMain traces all references of a symbol to main functions
+func (t *DirectTracer) TraceReferencesToMain(pos Position, symbolName string) ([]CallPath, error) {
+	// Find all references
+	refs, err := t.FindReferences(pos, symbolName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find references: %w", err)
+	}
+
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	// For each reference, trace the containing function to main
+	var allPaths []CallPath
+	seenBinaries := make(map[string]bool)
+
+	for _, ref := range refs {
+		if ref.ContainingFunc == "" {
+			continue
+		}
+
+		// Convert reference position back to Position
+		refPos := Position{
+			Filename: strings.TrimPrefix(ref.URI, "file://"),
+			Line:     int(ref.Range.Start.Line) + 1,
+			Column:   int(ref.Range.Start.Character) + 1,
+		}
+
+		// Trace this reference's containing function to main
+		paths, err := t.TraceToMain(refPos, ref.ContainingFunc)
+		if err != nil {
+			// Log but continue with other references
+			fmt.Printf("Warning: failed to trace %s: %v\n", ref.ContainingFunc, err)
+			continue
+		}
+
+		// Add paths, avoiding duplicates by binary name
+		for _, path := range paths {
+			if !seenBinaries[path.BinaryName] {
+				seenBinaries[path.BinaryName] = true
+				allPaths = append(allPaths, path)
+			}
+		}
+	}
+
+	return allPaths, nil
+}

@@ -10,6 +10,7 @@ type Position = ripplesapi.Position
 type CallNode = ripplesapi.CallNode
 type CallPath = ripplesapi.CallPath
 type DirectTracer = ripplesapi.DirectTracer
+type Reference = ripplesapi.Reference
 
 // NewDirectTracer creates a new DirectTracer
 var NewDirectTracer = ripplesapi.NewDirectTracer
