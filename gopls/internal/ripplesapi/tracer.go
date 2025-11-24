@@ -4,17 +4,22 @@ package ripplesapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/cache/metadata"
 	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/filecache"
 	"golang.org/x/tools/gopls/internal/golang"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/settings"
@@ -56,12 +61,15 @@ type CallPath struct {
 
 // DirectTracer directly uses gopls internal packages for call hierarchy analysis
 type DirectTracer struct {
-	session  *cache.Session
-	view     *cache.View
-	snapshot *cache.Snapshot
-	release  func()
-	rootPath string
-	ctx      context.Context
+	session            *cache.Session
+	view               *cache.View
+	snapshot           *cache.Snapshot
+	release            func()
+	rootPath           string
+	ctx                context.Context
+	globalSeenBinaries sync.Map // map[string]bool - Shared across all traces to early-exit
+	callCache          sync.Map // map[string][]protocol.CallHierarchyIncomingCall - Cache for IncomingCalls
+	traceCache         sync.Map // map[string][]CallPath - Cache entire TraceToMain results
 }
 
 // NewDirectTracer creates a new DirectTracer
@@ -84,14 +92,16 @@ func NewDirectTracer(ctx context.Context, rootPath string) (*DirectTracer, error
 		return nil, fmt.Errorf("failed to create view: %w", err)
 	}
 
-	return &DirectTracer{
+	dt := &DirectTracer{
 		session:  session,
 		view:     view,
 		snapshot: snapshot,
 		release:  release,
 		rootPath: rootPath,
 		ctx:      ctx,
-	}, nil
+	}
+	// sync.Map doesn't need initialization
+	return dt, nil
 }
 
 // createFolder creates a Folder with default options
@@ -130,6 +140,27 @@ func (t *DirectTracer) Close() error {
 
 // TraceToMain traces a symbol to all main functions that call it
 func (t *DirectTracer) TraceToMain(pos Position, functionName string) ([]CallPath, error) {
+	// Generate cache key for both in-memory and persistent cache
+	cacheKey := fmt.Sprintf("%s:%d:%d:%s", pos.Filename, pos.Line, pos.Column, functionName)
+
+	// Check persistent cache first (survives across runs)
+	persistentCacheKey := sha256.Sum256([]byte(cacheKey))
+	if cached, err := filecache.Get("ripples-trace", persistentCacheKey); err == nil {
+		var paths []CallPath
+		if err := json.Unmarshal(cached, &paths); err == nil {
+			log.Debug().Str("key", cacheKey).Msg("Using PERSISTENT cached trace")
+			// Also store in in-memory cache for faster subsequent access
+			t.traceCache.Store(cacheKey, paths)
+			return paths, nil
+		}
+	}
+
+	// Check in-memory trace cache (function-level caching)
+	if cached, ok := t.traceCache.Load(cacheKey); ok {
+		log.Debug().Str("key", cacheKey).Msg("Using in-memory cached TraceToMain result")
+		return cached.([]CallPath), nil
+	}
+
 	// Convert file path to URI
 	uri := protocol.URIFromPath(pos.Filename)
 
@@ -169,7 +200,8 @@ func (t *DirectTracer) TraceToMain(pos Position, functionName string) ([]CallPat
 			Msg("PrepareCallHierarchy found item")
 	}
 
-	// Trace incoming calls recursively
+	// Trace incoming calls recursively with depth limit
+	const maxDepth = 30 // Prevent runaway recursion (reduced from 50 for better performance)
 	var paths []CallPath
 	visited := make(map[string]bool)
 	seenBinaries := make(map[string]bool)
@@ -181,7 +213,21 @@ func (t *DirectTracer) TraceToMain(pos Position, functionName string) ([]CallPat
 		}
 		// Check if the initial symbol is in a common package
 		startedInCommonPkg := isCommonPackage(initialNode.PackagePath)
-		t.traceIncomingCalls(item, []CallNode{initialNode}, visited, &paths, seenBinaries, startedInCommonPkg)
+		t.traceIncomingCallsWithDepth(item, []CallNode{initialNode}, visited, &paths, seenBinaries, startedInCommonPkg, 0, maxDepth)
+	}
+
+	// Store in both caches before returning
+	t.traceCache.Store(cacheKey, paths)
+	log.Debug().Str("key", cacheKey).Int("paths", len(paths)).Msg("Cached TraceToMain result in memory")
+
+	// Store in persistent cache (survives across runs)
+	if data, err := json.Marshal(paths); err == nil {
+		persistentCacheKey := sha256.Sum256([]byte(cacheKey))
+		if err := filecache.Set("ripples-trace", persistentCacheKey, data); err == nil {
+			log.Debug().Str("key", cacheKey).Msg("Stored trace in PERSISTENT cache")
+		} else {
+			log.Warn().Err(err).Msg("Failed to store in persistent cache")
+		}
 	}
 
 	return paths, nil
@@ -237,16 +283,33 @@ func (t *DirectTracer) extractPackageFromURI(uri protocol.DocumentURI) string {
 	return string(pkgs[0].PkgPath)
 }
 
-// traceIncomingCalls recursively traces incoming calls
-func (t *DirectTracer) traceIncomingCalls(
+// traceIncomingCallsWithDepth recursively traces incoming calls with depth limit
+func (t *DirectTracer) traceIncomingCallsWithDepth(
 	item protocol.CallHierarchyItem,
 	currentPath []CallNode,
 	visited map[string]bool,
 	paths *[]CallPath,
 	seenBinaries map[string]bool,
 	startedInCommonPkg bool, // true if the original changed symbol was in a common package
+	depth int,
+	maxDepth int,
 ) {
-	log.Debug().Str("name", item.Name).Msg("traceIncomingCalls")
+	callStart := time.Now()
+	defer func() {
+		elapsed := time.Since(callStart)
+		if elapsed > 500*time.Millisecond {
+			log.Warn().Str("name", item.Name).Int("depth", depth).Dur("elapsed", elapsed).
+				Msg("SLOW traceIncomingCalls")
+		}
+	}()
+
+	log.Debug().Str("name", item.Name).Int("depth", depth).Msg("traceIncomingCalls")
+
+	// Check depth limit
+	if depth >= maxDepth {
+		log.Warn().Str("name", item.Name).Int("depth", depth).Msg("Max trace depth reached, stopping recursion")
+		return
+	}
 
 	// Create a unique key for this item
 	key := fmt.Sprintf("%s:%d:%d", item.URI, item.Range.Start.Line, item.Range.Start.Character)
@@ -261,7 +324,13 @@ func (t *DirectTracer) traceIncomingCalls(
 	if isMainFunction(item) {
 		binaryName := getBinaryName(item)
 
-		// Deduplicate by binary name
+		// Check global cache first (thread-safe early exit using sync.Map)
+		if _, alreadySeen := t.globalSeenBinaries.LoadOrStore(binaryName, true); alreadySeen {
+			log.Debug().Str("binary", binaryName).Msg("Binary already found globally, skipping")
+			return
+		}
+
+		// Deduplicate by binary name locally
 		if seenBinaries[binaryName] {
 			return
 		}
@@ -279,19 +348,49 @@ func (t *DirectTracer) traceIncomingCalls(
 		return
 	}
 
-	// Get file handle for incoming calls
-	fh, err := t.snapshot.ReadFile(t.ctx, item.URI)
-	if err != nil {
-		fmt.Printf("Warning: failed to read file %s: %v\n", item.URI, err)
-		return
+	// Get incoming calls (with caching using sync.Map)
+	cacheKey := fmt.Sprintf("%s:%d:%d", item.URI, item.Range.Start.Line, item.Range.Start.Character)
+
+	var incomingCalls []protocol.CallHierarchyIncomingCall
+
+	// Try cache first
+	if cached, ok := t.callCache.Load(cacheKey); ok {
+		log.Debug().Str("key", cacheKey).Msg("Using cached IncomingCalls")
+		incomingCalls = cached.([]protocol.CallHierarchyIncomingCall)
+	} else {
+		// Get file handle for incoming calls
+		fh, err := t.snapshot.ReadFile(t.ctx, item.URI)
+		if err != nil {
+			fmt.Printf("Warning: failed to read file %s: %v\n", item.URI, err)
+			return
+		}
+
+		// Get incoming calls using gopls internal API
+		// Add timing to measure how slow this is
+		startTime := time.Now()
+		incomingCalls, err = golang.IncomingCalls(t.ctx, t.snapshot, fh, item.Range.Start)
+		elapsed := time.Since(startTime)
+		if err != nil {
+			fmt.Printf("Warning: failed to get incoming calls for %s: %v\n", item.Name, err)
+			return
+		}
+
+		// Log slow calls
+		if elapsed > 500*time.Millisecond {
+			log.Warn().Str("name", item.Name).Dur("elapsed", elapsed).
+				Msg("SLOW IncomingCalls detected")
+		} else {
+			log.Debug().Str("name", item.Name).Dur("elapsed", elapsed).
+				Msg("IncomingCalls timing")
+		}
+
+		// Cache the result
+		t.callCache.Store(cacheKey, incomingCalls)
+		log.Debug().Str("key", cacheKey).Int("count", len(incomingCalls)).Msg("Cached IncomingCalls")
 	}
 
-	// Get incoming calls using gopls internal API
-	incomingCalls, err := golang.IncomingCalls(t.ctx, t.snapshot, fh, item.Range.Start)
-	if err != nil {
-		fmt.Printf("Warning: failed to get incoming calls for %s: %v\n", item.Name, err)
-		return
-	}
+	// Filter out test functions early (huge performance win)
+	incomingCalls = filterTestFunctions(incomingCalls)
 
 	pkgPath := extractPackageFromItem(item)
 
@@ -299,6 +398,14 @@ func (t *DirectTracer) traceIncomingCalls(
 		// Dead end - no callers found
 		log.Debug().Str("name", item.Name).Str("package", pkgPath).Msg("No incoming calls found")
 		return
+	}
+
+	// Limit the number of callers to avoid exponential explosion
+	const maxCallersPerLevel = 20
+	if len(incomingCalls) > maxCallersPerLevel {
+		log.Debug().Str("name", item.Name).Int("original", len(incomingCalls)).
+			Int("limited", maxCallersPerLevel).Msg("Limiting callers per level")
+		incomingCalls = incomingCalls[:maxCallersPerLevel]
 	}
 
 	log.Debug().Str("name", item.Name).Int("count", len(incomingCalls)).Msg("IncomingCalls returned callers")
@@ -311,7 +418,13 @@ func (t *DirectTracer) traceIncomingCalls(
 	// When gopls returns incoming calls for an interface method, it includes ALL
 	// callers of that interface, not just the ones calling THIS specific implementation.
 	// We need to filter these to avoid cross-service false positives.
+	filterStart := time.Now()
 	incomingCalls = t.filterAmbiguousInterfaceCalls(item, currentPath, incomingCalls, startedInCommonPkg)
+	filterElapsed := time.Since(filterStart)
+	if filterElapsed > 100*time.Millisecond {
+		log.Warn().Str("name", item.Name).Dur("elapsed", filterElapsed).
+			Int("callers", len(incomingCalls)).Msg("SLOW filtering detected")
+	}
 
 	// Recursively trace each caller
 	for _, call := range incomingCalls {
@@ -333,8 +446,20 @@ func (t *DirectTracer) traceIncomingCalls(
 		// Build the new path with the caller
 		newPath := append([]CallNode{callerNode}, currentPath...)
 
-		t.traceIncomingCalls(call.From, newPath, visited, paths, seenBinaries, startedInCommonPkg)
+		t.traceIncomingCallsWithDepth(call.From, newPath, visited, paths, seenBinaries, startedInCommonPkg, depth+1, maxDepth)
 	}
+}
+
+// traceIncomingCalls is kept for backward compatibility
+func (t *DirectTracer) traceIncomingCalls(
+	item protocol.CallHierarchyItem,
+	currentPath []CallNode,
+	visited map[string]bool,
+	paths *[]CallPath,
+	seenBinaries map[string]bool,
+	startedInCommonPkg bool,
+) {
+	t.traceIncomingCallsWithDepth(item, currentPath, visited, paths, seenBinaries, startedInCommonPkg, 0, 50)
 }
 
 // isCrossServiceCall checks if a call path crosses service boundaries
@@ -1073,4 +1198,28 @@ func longestCommonPrefix(s1, s2 string) int {
 	}
 
 	return minLen
+}
+
+// filterTestFunctions filters out test functions and test files
+// Test functions don't contribute to production call chains
+func filterTestFunctions(calls []protocol.CallHierarchyIncomingCall) []protocol.CallHierarchyIncomingCall {
+	var filtered []protocol.CallHierarchyIncomingCall
+	for _, call := range calls {
+		// Skip test files
+		uri := string(call.From.URI)
+		if strings.HasSuffix(uri, "_test.go") {
+			continue
+		}
+
+		// Skip test functions (Test*, Benchmark*, Example*)
+		funcName := call.From.Name
+		if strings.HasPrefix(funcName, "Test") ||
+			strings.HasPrefix(funcName, "Benchmark") ||
+			strings.HasPrefix(funcName, "Example") {
+			continue
+		}
+
+		filtered = append(filtered, call)
+	}
+	return filtered
 }
